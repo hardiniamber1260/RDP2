@@ -30,7 +30,7 @@ jobs:
       - name: Create RDP2 User with Fixed Password
         run: |
           # Set your fixed password here
-          $fixedPassword = "YourSecurePassword123!"  # CHANGE THIS to your desired password
+          $fixedPassword = "${{ secrets.RDP_FIXED_PASSWORD }}"  # CHANGE THIS to your desired password
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
           
           # Create or update the user
