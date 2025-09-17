@@ -30,7 +30,7 @@ jobs:
       - name: Create RDP2 User with Fixed Password
         run: |
           # Set your fixed password here
-          $fixedPassword = "${{ secrets.RDP_FIXED_PASSWORD }}"  # CHANGE THIS to your desired password
+          $fixedPassword = "${{ secrets.RDP_FIXED_PASSWORD }}"
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
           
           # Create or update the user
@@ -53,45 +53,61 @@ jobs:
       
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
       
-      - name: Establish Tailscale Connection with Fixed Hostname
+      - name: Establish Tailscale Connection with Valid Hostname
         run: |
-          # Generate a consistent hostname based on runner ID (or use a fixed one)
-          $hostname = "github-rdp-$env:GITHUB_REPOSITORY"  # Based on repo name
+          # Create a valid DNS hostname (remove invalid characters)
+          $validHostname = "github-rdp-runner-$env:GITHUB_RUN_ID" -replace '[^a-zA-Z0-9-]', '-'
+          Write-Host "Using hostname: $validHostname"
           
-          # Bring up Tailscale with the provided auth key and set a fixed hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          # Bring up Tailscale with the provided auth key
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$validHostname --accept-routes=true --accept-dns=true
           
-          # Wait for Tailscale to assign an IP
+          # Wait for Tailscale to fully initialize and get an IP
           $tsIP = $null
           $tsHostname = $null
           $retries = 0
-          while ((-not $tsIP -or -not $tsHostname) -and $retries -lt 15) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              $tsHostname = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName
-              Start-Sleep -Seconds 3
+          $maxRetries = 20
+          
+          while ($retries -lt $maxRetries) {
+              # Check if Tailscale is running and authenticated
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+              
+              if ($status -and $status.BackendState -eq "Running") {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  $tsHostname = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName -ErrorAction SilentlyContinue
+                  
+                  if ($tsIP -and $tsHostname) {
+                      break
+                  }
+              }
+              
+              Write-Host "Waiting for Tailscale to connect... (Attempt $($retries + 1)/$maxRetries)"
+              Write-Host "Current state: $($status.BackendState)"
+              Start-Sleep -Seconds 5
               $retries++
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale failed to connect after $maxRetries attempts"
+              Write-Host "Debug info:"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
               exit 1
-          }
-          
-          if (-not $tsHostname) {
-              Write-Warning "Tailscale hostname not available, using IP only"
-              $tsHostname = $tsIP
           }
           
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=$tsHostname" >> $env:GITHUB_ENV
           echo "RDP_CONNECTION_STRING=$tsHostname" >> $env:GITHUB_ENV
+          
+          Write-Host "Tailscale connected successfully!"
+          Write-Host "IP: $tsIP"
+          Write-Host "Hostname: $tsHostname"
       
       - name: Verify RDP Accessibility
         run: |
@@ -113,14 +129,14 @@ jobs:
           Write-Host "IP Address: $env:TAILSCALE_IP"
           Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
           Write-Host "Username: RDP2"
-          Write-Host "Password: ${{ secrets.RDP_FIXED_PASSWORD }}"
+          Write-Host "Password: ********"  # Don't show password in logs
           Write-Host "=================================`n"
           
-          # Also output to GitHub step summary for easy access
+          # Also output to GitHub step summary for easy access (password will be masked)
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## RDP Connection Details"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Address:** $env:RDP_CONNECTION_STRING"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Username:** RDP2"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Password:** ${{ secrets.RDP_FIXED_PASSWORD }}"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Password:** `${{ secrets.RDP_FIXED_PASSWORD }}"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Note:** Use Tailscale client on your local machine to connect"
       
       - name: Maintain Connection
