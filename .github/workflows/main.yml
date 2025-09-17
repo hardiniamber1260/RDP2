@@ -11,94 +11,75 @@ jobs:
     steps:
       - name: Configure Core RDP Settings
         run: |
-          # Enable Remote Desktop and disable Network Level Authentication (if needed)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                             -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                             -Name "SecurityLayer" -Value 0 -Force
-          # Remove any existing rule with the same name to avoid duplication
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          
-          # For testing, allow any incoming connection on port 3389
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-          # (Optional) Restart the Remote Desktop service to ensure changes take effect
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
       
       - name: Create RDP2 User with Fixed Password
         run: |
-          # Set your fixed password here
-          $fixedPassword = "${{ secrets.RDP_FIXED_PASSWORD }}"  # CHANGE THIS to your desired password
+          $fixedPassword = "${{ secrets.RDP_FIXED_PASSWORD }}"
           $securePass = ConvertTo-SecureString $fixedPassword -AsPlainText -Force
-          
-          # Create or update the user
           $userExists = Get-LocalUser -Name "RDP2" -ErrorAction SilentlyContinue
           if ($userExists) {
               Set-LocalUser -Name "RDP2" -Password $securePass
-              Write-Host "Updated existing RDP2 user password"
           } else {
               New-LocalUser -Name "RDP2" -Password $securePass -AccountNeverExpires
-              Write-Host "Created new RDP2 user"
           }
-          
-          # Add to required groups
           Add-LocalGroupMember -Group "Administrators" -Member "RDP2" -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP2" -ErrorAction SilentlyContinue
-          
-          echo "RDP2_CREDS=User: RDP2 | Password: $fixedPassword" >> $env:GITHUB_ENV
-          
-          Write-Host "RDP2 user configured with fixed password"
       
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
-          
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
       
-      - name: Establish Tailscale Connection with Fixed Hostname
+      - name: Establish Tailscale Connection with Simple Hostname
         run: |
-          # Generate a consistent hostname based on runner ID (or use a fixed one)
-          #$hostname = "github-rdp-$env:GITHUB_REPOSITORY"  # Based on repo name
-          $hostname = "github-rdp-runner"  # Same hostname every time
-          # Bring up Tailscale with the provided auth key and set a fixed hostname
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$hostname
+          $simpleHostname = "rdp1"
+          Write-Host "Using simple hostname: $simpleHostname"
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$simpleHostname --accept-routes=true --accept-dns=true
           
-          # Wait for Tailscale to assign an IP
           $tsIP = $null
           $tsHostname = $null
           $retries = 0
-          while ((-not $tsIP -or -not $tsHostname) -and $retries -lt 15) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              $tsHostname = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName
-              Start-Sleep -Seconds 3
+          $maxRetries = 20
+          
+          while ($retries -lt $maxRetries) {
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json -ErrorAction SilentlyContinue
+              if ($status -and $status.BackendState -eq "Running") {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  $tsHostname = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json | Select-Object -ExpandProperty Self | Select-Object -ExpandProperty DNSName -ErrorAction SilentlyContinue
+                  if ($tsIP -and $tsHostname) { break }
+              }
+              Write-Host "Waiting for Tailscale... (Attempt $($retries + 1)/$maxRetries)"
+              Start-Sleep -Seconds 5
               $retries++
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+              Write-Error "Tailscale failed to connect after $maxRetries attempts"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
               exit 1
-          }
-          
-          if (-not $tsHostname) {
-              Write-Warning "Tailscale hostname not available, using IP only"
-              $tsHostname = $tsIP
           }
           
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
           echo "TAILSCALE_HOSTNAME=$tsHostname" >> $env:GITHUB_ENV
-          echo "RDP_CONNECTION_STRING=$tsHostname" >> $env:GITHUB_ENV
+          echo "RDP_CONNECTION_STRING=$simpleHostname" >> $env:GITHUB_ENV
+          Write-Host "Tailscale connected successfully!"
+          Write-Host "IP: $tsIP"
+          Write-Host "Hostname: $tsHostname"
+          Write-Host "Simple Connection Name: $simpleHostname"
       
       - name: Verify RDP Accessibility
         run: |
           Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          Write-Host "Tailscale Hostname: $env:TAILSCALE_HOSTNAME"
-          
-          # Test connectivity using Test-NetConnection against the Tailscale IP on port 3389
+          Write-Host "Connection Name: $env:RDP_CONNECTION_STRING"
           $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
@@ -111,23 +92,17 @@ jobs:
           Write-Host "`n=== RDP ACCESS INFORMATION ==="
           Write-Host "Connection Address: $env:RDP_CONNECTION_STRING"
           Write-Host "IP Address: $env:TAILSCALE_IP"
-          Write-Host "Hostname: $env:TAILSCALE_HOSTNAME"
           Write-Host "Username: RDP2"
-          Write-Host "Password: ${{ secrets.RDP_FIXED_PASSWORD }}"
           Write-Host "=================================`n"
           
-          # Also output to GitHub step summary for easy access
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "## RDP Connection Details"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Address:** $env:RDP_CONNECTION_STRING"
           Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Username:** RDP2"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Password:** ${{ secrets.RDP_FIXED_PASSWORD }}"
-          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Note:** Use Tailscale client on your local machine to connect"
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value "**Password:** `${{ secrets.RDP_FIXED_PASSWORD }}"
       
       - name: Maintain Connection
         run: |
-          # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
               Write-Host "[$(Get-Date)] RDP Active - Connect to: $env:RDP_CONNECTION_STRING"
-              Write-Host "[$(Get-Date)] Use Ctrl+C in GitHub workflow to terminate"
               Start-Sleep -Seconds 300
           }
